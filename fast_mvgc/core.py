@@ -1,10 +1,12 @@
 import numpy as np
 import torch
 import warnings
+from ._validation import validate_data, validate_parameters
 
 def check_backend(device: str = 'cuda'):
-    if device == 'cuda' and not torch.cuda.is_available():
-        warnings.warn("CUDA not available, falling back to CPU.")
+    device = torch.device(device)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        warnings.warn("CUDA not available, falling back to CPU.", stacklevel=2)
         return torch.device('cpu')
     return torch.device(device)
 
@@ -22,7 +24,7 @@ def compute_mvgc(X: np.ndarray, p: int, alpha: float = 0.01, device: str = 'cuda
     Returns:
         F: (n_channels, n_channels) 格兰杰因果矩阵。F[i, j] 代表 j -> i 的因果强度。
     """
-    X = np.asarray(X)
+    X = validate_data(X, ndim=2)
     
     # 维度检查与修正
     if X.ndim != 2:
@@ -43,6 +45,8 @@ def compute_mvgc_batch(X_batch: np.ndarray, p: int, alpha: float = 0.01, device:
     """
     批量 MVGC 计算函数。
     """
+    X_batch = validate_data(X_batch, ndim=3)
+    p, alpha = validate_parameters(p, alpha, X_batch.shape[-1])
     dev = check_backend(device)
     X_t = torch.from_numpy(X_batch).to(dev, dtype=torch.float64) # 使用 float64 提高精度
     
@@ -52,6 +56,16 @@ def compute_mvgc_batch(X_batch: np.ndarray, p: int, alpha: float = 0.01, device:
         
     return F_res.cpu().numpy()
 
+
+def _ridge_solve(design, response, gram, rhs, alpha):
+    # Solve the design directly for unregularized rank-deficient models.
+    if alpha == 0:
+        return torch.bmm(torch.linalg.pinv(design), response)
+    try:
+        return torch.cholesky_solve(rhs, torch.linalg.cholesky(gram))
+    except RuntimeError:
+        return torch.bmm(torch.linalg.pinv(gram), rhs)
+
 def _mvgc_batch_kernel(segments: torch.Tensor, p: int, alpha: float, dev: torch.device) -> torch.Tensor:
     """
     PyTorch 核心计算逻辑：向量化 OLS 回归 + 岭回归正则化
@@ -59,6 +73,8 @@ def _mvgc_batch_kernel(segments: torch.Tensor, p: int, alpha: float, dev: torch.
     return: (B, n, n)
     """
     B, n, T = segments.shape
+    if n == 1:
+        return torch.zeros((B, 1, 1), dtype=segments.dtype, device=dev)
     if T <= p:
         raise ValueError(f'Time length {T} must be > order {p}')
         
@@ -95,13 +111,7 @@ def _mvgc_batch_kernel(segments: torch.Tensor, p: int, alpha: float, dev: torch.
     
     # 使用 cholesky 或 solve 求解比求逆更稳定
     # beta_full: (B, D, n)
-    try:
-        # 尝试更快的 Cholesky
-        L = torch.linalg.cholesky(ZTZ_reg)
-        beta_full = torch.cholesky_solve(ZTY, L)
-    except:
-        # 回退到标准求逆 (伪逆)
-        beta_full = torch.linalg.solve(ZTZ_reg, ZTY)
+    beta_full = _ridge_solve(Zs, Y, ZTZ_reg, ZTY, alpha)
 
     # 计算 Full Model 残差方差 sigma_full
     resid_full = Y - torch.bmm(Zs, beta_full)
@@ -116,13 +126,12 @@ def _mvgc_batch_kernel(segments: torch.Tensor, p: int, alpha: float, dev: torch.
     all_cols = torch.arange(D, device=dev)
     
     for j in range(n): # j 是 Source (因)
-        # 剔除 j 的所有滞后项 (columns: j*p, j*p+1, ..., (j+1)*p-1)
+        # Lag-major columns for source j are j, j+n, ..., j+(p-1)*n.
         # 保留 Target i 和其他变量 Z
         
         # 确定要保留的列索引
         # 这是一个简单的掩码操作
-        mask = torch.ones(D, dtype=torch.bool, device=dev)
-        mask[j*p : (j+1)*p] = False
+        mask = (all_cols % n) != j
         keep_idx = all_cols[mask]
         
         # 提取 Reduced 设计矩阵 Z_red
@@ -138,11 +147,7 @@ def _mvgc_batch_kernel(segments: torch.Tensor, p: int, alpha: float, dev: torch.
         eye_r = torch.eye(D_red, device=dev, dtype=ZTZ_r.dtype).unsqueeze(0).expand(B, D_red, D_red)
         ZTZ_r_reg = ZTZ_r + alpha * eye_r
         
-        try:
-            L_r = torch.linalg.cholesky(ZTZ_r_reg)
-            beta_r = torch.cholesky_solve(ZTY_r, L_r)
-        except:
-            beta_r = torch.linalg.solve(ZTZ_r_reg, ZTY_r)
+        beta_r = _ridge_solve(Zs_red, Y, ZTZ_r_reg, ZTY_r, alpha)
             
         resid_r = Y - torch.bmm(Zs_red, beta_r)
         sigma_red = resid_r.pow(2).sum(dim=1) # (B, n) - 每个变量作为 Target 时的 Reduced 方差

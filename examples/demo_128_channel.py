@@ -6,10 +6,10 @@ import sys
 # 假设用户在项目根目录下运行，添加路径以便导入库
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from fast_mvgc import compute_mvgc_batch
-from fast_mvgc.utils import segment_data
+from pytorch_mvgc import compute_mvgc_batch
+from pytorch_mvgc.utils import segment_data
 
-def demo_high_dim():
+def demo_high_dim(device='cuda'):
     print("=== 128通道数据 MVGC 计算演示 ===")
     
     # 1. 模拟数据生成 (128通道, 2000时间点)
@@ -33,7 +33,7 @@ def demo_high_dim():
     
     try:
         # p=5, alpha=0.01
-        F_batch = compute_mvgc_batch(segments, p=5, alpha=0.01, device='cuda')
+        F_batch = compute_mvgc_batch(segments, p=5, alpha=0.01, device=device)
         
     except Exception as e:
         print(f"   [Error] GPU计算失败: {e}")
@@ -60,4 +60,7 @@ def demo_high_dim():
     print(f"\n结果已保存至 {out_file}")
 
 if __name__ == "__main__":
-    demo_high_dim()
+    import argparse
+    parser = argparse.ArgumentParser(description='128-channel MVGC demonstration')
+    parser.add_argument('--device', default='cuda', help='PyTorch device, e.g. cpu or cuda:0')
+    demo_high_dim(parser.parse_args().device)
